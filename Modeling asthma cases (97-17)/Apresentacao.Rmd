@@ -1,0 +1,236 @@
+---
+title: "Análise de internações de crianças por asma no Paraná"
+subtitle: "Séries Temporais - DES - UEM"
+author: "Arthur Rocha"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: leonids
+    highlight: github
+---
+
+## Introdução
+
+Esse trabalho foi feito com objetivo de ser uma avaliação parcial da segunda parte do conteúdo da disciplina de séries temporais, ministrada pela Prof. Dra. Eniuce Menezes de Souza.
+Tratam-se de dados retirados do DATASUS referentes a casos de internação por asma no Paraná de crianças com até 10 anos de idade.
+
+
+
+## Leitura dos dados e manipulação
+
+```{r message=FALSE, warning=FALSE}
+#Pacotes
+library(data.table) #Leitura de dados
+library(dplyr)      #Manipulação
+library(forecast)   #Séries temporais
+library(astsa)      #Séries temporais
+library(highcharter)#Gráficos interativos
+library(ggplot2)    #Gráficos
+
+## Dados brutos
+dados_int_pr=fread("C:\\Users\\ASUS\\Desktop\\Uem\\4 ano\\Séries Temporais\\Trabalho\\intern_asma_pr_97_2017.csv",
+                   encoding = "UTF-8")
+
+## Série completa
+dados_int_pr %>%
+  group_by(idade_cat , ano, mes)%>%
+  summarise(n=n()) %>%
+  filter(idade_cat=="Infância") %>%
+  as.data.frame()%>%
+  select(n) -> serie.comp
+
+## Série de "treinamento"
+serie.comp[- c(226:237),1] %>%
+  ts(start = 1998,frequency = 12) -> serie
+
+## Série de teste (12 meses finais)
+serie.comp[226:237,1]%>%
+ts(start = c(2016,10),frequency = 12) -> teste
+
+```
+
+## Série temporal
+
+É visível uma tendência negativa e uma variância não constante na série
+```{r}
+hchart(serie)%>%
+  hc_add_theme(hc_theme_538(colors = c('orange', 'green', 'blue')))
+```
+
+Diferenciando a série uma vez é possível retirar a tendência, mas fica evidente a inconstância da variância. Logo, é preciso aplicar uma transformação na série.
+```{r}
+serie %>%
+  diff() %>%
+  hchart()%>%
+  hc_add_theme(hc_theme_538(colors = c('orange', 'green', 'blue')))
+```
+
+Vê-se que parece razoável assumir uma variância constante após a transformação.
+```{r}
+serie %>%
+  log() %>%
+  diff() %>%
+  hchart()%>%
+  hc_add_theme(hc_theme_538(colors = c('orange', 'green', 'blue'))) %>%
+  hc_add_series(diff(log(serie),differences = 2))
+```
+
+Observando a FAC e FACp, é visível que existe uma sazonalidade na parte modelável por médias móveis.
+```{r message=FALSE, warning=FALSE}
+serie %>%
+  log() %>%
+  diff() %>%
+  acf2(max.lag = 48)
+```
+
+
+
+## Modelagem
+
+Como visto anteriormente, existe evidência de tendência, sazonalidade e variância não constante. Resolvidas as questões de tendência e variância por diferenciação e transformação log, faremos a identificação do modelo por partes, modelando primeiro a sazonalidade e depois os termos de médias móveis e autorregressivos.
+
+
+- Modelo mais simples, considerando apenas a sazonalidade na parte de médias móveis.
+
+Nota-se que o modelo não ficou bem ajustado pelas funções de autocorrelação e autocorrelaçã parcial. Dando indícios de que precisa de um parâmetro de médias móveis.
+```{r message=FALSE, warning=FALSE,fig.height=12, fig.width=15}
+serie.log= log(serie)
+
+modelo1 = sarima(serie.log,p = 0,d=1,q=0,P=0,D = 1,Q = 1,S = 12)
+
+modelo1$fit$residuals %>%
+acf2()
+
+```
+
+- Incrementando o modelo
+
+É possível ver que "sobram" autocorrelações aparentemente significantes, sendo que há indicatívos de que um termo de médias móveis é necessário dado o comportamento da FAC e FACp(decaimento exponencial), logo vamos adicioná-lo.
+
+O modelo se apresentou melhor, mas não passando no critério de Ljung-Box.
+
+```{r message=FALSE, warning=FALSE,fig.height=12, fig.width=15}
+(modelo2 = sarima(serie.log,p = 0,d=1,q=1,P=0,D = 1,Q = 1,S = 12))
+
+modelo2$fit$residuals %>%
+acf2()
+
+```
+
+Adicionando um termo autorregressivo o problema foi resolvido.
+
+```{r message=FALSE, warning=FALSE,fig.height=12, fig.width=15}
+(modelo3 = sarima(serie.log,p = 1,d=1,q=1,P=0,D = 1,Q = 1,S = 12))
+
+modelo3$fit$residuals %>%
+acf2()
+
+```
+
+
+- Modelo de suavização exponencial
+
+A partir do comando `ets` do pacote `forecast`, chegou-se ao melhor modelo de suvização exponencial, com erro e sazonalidade multiplicativos e tendência aditiva.
+
+```{r message=FALSE, warning=FALSE}
+(modelo.ets = ets(serie))
+
+```
+
+
+
+- Modelo da função `auto.arima`
+
+O pacote `forecast` também conta com a função `auto.arima`, que tenta achar qual o melhor modelo das classes arima / sarima para se ajustar à série. No caso, ajustou um ARIMA(2,1,3)(1,0,0)[12]. Esse modelo não teve os melhores resíduos, não passando no teste de Ljung-Box
+
+```{r message=FALSE, warning=FALSE,fig.height=12, fig.width=15}
+(modelo.auto = auto.arima(serie.log))
+
+modelo.auto = sarima(serie,2,1,3,1,0,0,12) #Só para soltar o diagnóstico
+
+modelo.auto$fit$residuals %>%
+acf2()
+
+```
+
+
+## Previsão
+
+Aqui são expostos os resultados das previsões dos modelos escolhidos.
+
+- Modelo Sarima (1,1,1)(0,1,1)
+
+```{r message=FALSE, warning=FALSE}
+Arima(serie,order = c(1,1,1),seasonal = c(0,1,1),lambda = 0)%>%
+forecast(h=12) -> mae.dina
+
+hchart(mae.dina) %>%
+  hc_add_series(teste,type = "scatter")%>%
+  hc_add_theme(hc_theme_538(colors=c("orange",rgb(.1,.2,.2,.4),rgb(.2,.2,.2,.4),rgb(.1,.2,.2,.4))))
+```
+
+
+- Modelo de suavização exponencial
+
+```{r message=FALSE, warning=FALSE}
+mae.dina2 = forecast(modelo.ets,h=12)
+
+hchart(mae.dina2) %>%
+  hc_add_series(teste,type = "scatter")%>%
+    hc_add_theme(hc_theme_538(colors=c("orange",rgb(.1,.2,.2,.4),
+                                      rgb(.2,.2,.2,.4),rgb(.1,.2,.2,.4))))
+```
+
+
+- Modelo auto.arima
+
+```{r message=FALSE, warning=FALSE}
+Arima(serie,order = c(2,1,3),seasonal = c(1,0,0),lambda = 0)%>%
+forecast(h=12) -> mae.dina3
+
+hchart(mae.dina3) %>%
+  hc_add_series(teste,type = "scatter")%>%
+  hc_add_theme(hc_theme_538(colors=c("orange",rgb(.1,.2,.2,.4),
+                                      rgb(.2,.2,.2,.4),rgb(.1,.2,.2,.4))))
+```
+
+
+
+- Todos juntos
+
+```{r}
+hchart(mae.dina,type="line")%>%
+  hc_add_series(mae.dina2,type="line")%>%
+  hc_add_series(mae.dina3,type="line")%>%
+  hc_add_series(teste,type = "scatter")%>%
+  hc_add_theme(hc_theme_538())
+```
+
+
+
+## Comparação entre modelos
+
+As comparações entre os modelos serão feitos a partir das medições de erro e U de Theil.
+
+```{r message=FALSE, warning=FALSE}
+library(DescTools)
+
+data.frame(modelo=c("Modelo teste","Modelo ets","Modelo auto"),
+           U_Theil = c(TheilU(as.numeric(teste),
+                              as.numeric(mae.dina$mean)),
+                       TheilU(as.numeric(teste),
+                              as.numeric(mae.dina2$mean)),
+                       TheilU(as.numeric(teste),
+                              as.numeric(mae.dina3$mean))
+                       )
+           ) %>%
+  cbind(rbind(accuracy(mae.dina,teste)[2,],
+      accuracy(mae.dina2,teste)[2,],
+      accuracy(mae.dina3,teste)[2,]))%>%
+  knitr::kable()
+
+
+```
+
+
+
